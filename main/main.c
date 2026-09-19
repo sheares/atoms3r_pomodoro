@@ -1,6 +1,7 @@
 #include "gc9107.h"
 #include "lp5562.h"
 #include "bmi270.h"
+#include "font.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -196,17 +197,63 @@ static uint16_t hsv565(float h)
     return RGB565((uint8_t)(r * 255), (uint8_t)(g * 255), (uint8_t)(b * 255));
 }
 
+/* Precomputed full-cycle hue LUT: 256 entries spanning HSV 0–360°. */
+static uint16_t s_rainbow_lut[256];
+static void init_rainbow_lut(void)
+{
+    for (int i = 0; i < 256; i++) {
+        s_rainbow_lut[i] = hsv565((float)i * 360.0f / 256.0f);
+    }
+}
+
+/* Transparent text overlay — only the glyph's foreground pixels are drawn,
+ * so the rainbow shows through where the glyph has no bits set. */
+static void draw_text_overlay(int x, int y, const char *str, uint16_t fg, uint8_t scale)
+{
+    while (*str) {
+        char c = *str++;
+        if (c < FONT_FIRST || c > FONT_LAST) c = '?';
+        const uint8_t *glyph = font5x8[c - FONT_FIRST];
+        for (int col = 0; col < FONT_WIDTH; col++) {
+            uint8_t col_data = glyph[col];
+            for (int row = 0; row < FONT_HEIGHT; row++) {
+                if (col_data & (1 << row)) {
+                    if (scale == 1) gc9107_draw_pixel(x + col, y + row, fg);
+                    else gc9107_fill_rect(x + col * scale, y + row * scale, scale, scale, fg);
+                }
+            }
+        }
+        x += (FONT_WIDTH + 1) * scale;
+    }
+}
+
 static void draw_rainbow(void)
 {
-    /* Diagonal stripes, scrolling. 16 stripes × 8 px each = 128. */
-    int phase = s_rainbow_frame * 6;
-    for (int y = 0; y < LCD_HEIGHT; y += 8) {
-        for (int x = 0; x < LCD_WIDTH; x += 8) {
-            uint16_t c = hsv565((float)(x + y + phase) * 1.4f);
-            gc9107_fill_rect(x, y, 8, 8, c);
+    /* Per-pixel diagonal rainbow via LUT — smooth, no blockiness.
+     * hue index = (x + y + phase) wrapped to 0..255 so it tiles seamlessly. */
+    const int phase = s_rainbow_frame * 2;
+    for (int y = 0; y < LCD_HEIGHT; y++) {
+        for (int x = 0; x < LCD_WIDTH; x++) {
+            gc9107_draw_pixel(x, y, s_rainbow_lut[(x + y + phase) & 0xFF]);
         }
     }
-    draw_centred(56, "DONE!", COLOR_WHITE, hsv565((float)(LCD_WIDTH + phase) * 1.4f), 2);
+    /* "DONE!" inside a flip-card matching the timer's look. */
+    const char *msg = "DONE!";
+    int text_w = 5 * 6 * 3;          /* 5 chars × (5+1) × scale 3 = 90 */
+    int text_h = 8 * 3;              /* font height × scale = 24 */
+    int card_w = text_w + 12;        /* 6 px H padding */
+    int card_h = text_h + 18;        /* 9 px V padding */
+    int card_x = (LCD_WIDTH  - card_w) / 2;
+    int card_y = (LCD_HEIGHT - card_h) / 2;
+    int half   = card_h / 2;
+
+    gc9107_fill_rect(card_x, card_y,            card_w, half,           C_CARD);
+    gc9107_fill_rect(card_x, card_y + half,     card_w, card_h - half,  C_CARD_LO);
+    gc9107_fill_rect(card_x, card_y + half - 1, card_w, 2,              C_CRACK);
+
+    int text_x = card_x + (card_w - text_w) / 2;
+    int text_y = card_y + (card_h - text_h) / 2;
+    draw_text_overlay(text_x, text_y, msg, C_DIGIT, 3);
 }
 
 /* ── Main loop ─────────────────────────────────────────────────────────────── */
@@ -214,6 +261,7 @@ void app_main(void)
 {
     gc9107_init();
     gc9107_set_rotation(3);             /* AtomS3R upright default */
+    init_rainbow_lut();
 
     i2c_master_bus_handle_t sys_bus = NULL;
     if (lp5562_init(&sys_bus)) {
